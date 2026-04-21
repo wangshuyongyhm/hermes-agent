@@ -108,6 +108,59 @@ def _format_conversation(messages: List[Dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def _extract_relevant_turns(
+    full_text: str, query: str, max_turns: int = 15
+) -> str:
+    """
+    Turn-level relevance filtering.
+
+    Splits a formatted conversation transcript into turns, scores each turn
+    by keyword overlap with the query, and returns the most relevant turns
+    in chronological order.
+
+    This reduces noise before summarization without changing the FTS5 layer.
+    """
+    if not full_text.strip():
+        return full_text
+
+    # Split on double newlines; each part is a turn like "[USER]: ..."
+    raw_turns = [t.strip() for t in full_text.split("\n\n") if t.strip()]
+    if len(raw_turns) <= max_turns:
+        return full_text
+
+    query_lower = query.lower().strip()
+    query_terms = [t for t in re.split(r"[^\w\u4e00-\u9fff]+", query_lower) if t]
+    if not query_terms:
+        return full_text
+
+    # Score each turn
+    def _score_turn(turn: str) -> float:
+        turn_lower = turn.lower()
+        score = 0.0
+        # Full phrase match gets highest bonus
+        if query_lower in turn_lower:
+            score += 10.0
+        # Term frequency + rarity bonus
+        for term in query_terms:
+            count = turn_lower.count(term)
+            if count:
+                score += count * (2.0 + 1.0 / max(1, len(term)))
+        # Proximity bonus: consecutive query terms in same turn
+        for i in range(len(query_terms) - 1):
+            if query_terms[i] in turn_lower and query_terms[i + 1] in turn_lower:
+                score += 1.5
+        return score
+
+    scored = [(_score_turn(t), i, t) for i, t in enumerate(raw_turns)]
+    # Keep strictly the top max_turns by score (ties broken by original index)
+    scored.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+    kept_indices = {scored[i][1] for i in range(min(max_turns, len(scored)))}
+
+    # Reassemble in original order so chronology is preserved
+    selected = [raw_turns[i] for i in range(len(raw_turns)) if i in kept_indices]
+    return "\n\n".join(selected)
+
+
 def _truncate_around_matches(
     full_text: str, query: str, max_chars: int = MAX_SESSION_CHARS
 ) -> str:
@@ -124,6 +177,9 @@ def _truncate_around_matches(
     Once candidate positions are collected the function picks the window
     start that covers the most of them.
     """
+    # --- NEW: turn-level noise reduction first -------------------------------
+    full_text = _extract_relevant_turns(full_text, query)
+
     if len(full_text) <= max_chars:
         return full_text
 
